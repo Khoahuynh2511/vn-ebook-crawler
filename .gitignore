@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+bin/*.exe
+bin/*.zip
+catalog.db
+catalog.db-shm
+catalog.db-wal
+*.part
