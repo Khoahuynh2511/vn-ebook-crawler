@@ -285,6 +285,19 @@ class BaseEbookSpider:
 
         return found
 
+    async def _queue_put_safe(
+        self, queue: asyncio.Queue, item: Tuple[str, str]
+    ) -> bool:
+        """Enqueue a book with non-blocking backpressure that respects rate_limited_stop."""
+        while True:
+            if self._reached_discovery_cap():
+                return False
+            try:
+                queue.put_nowait(item)
+                return True
+            except asyncio.QueueFull:
+                await asyncio.sleep(0.2)
+
     async def _enqueue_book(
         self,
         url: str,
@@ -305,8 +318,7 @@ class BaseEbookSpider:
         if queued_set is not None:
             queued_set.add(url)
         self.discovered_count += 1
-        await queue.put((url, category or "tong-hop"))
-        return True
+        return await self._queue_put_safe(queue, (url, category or "tong-hop"))
 
     async def _scan_sitemap(
         self,
@@ -505,7 +517,10 @@ class BaseEbookSpider:
             if url not in queued_set:
                 queued_set.add(url)
                 self.discovered_count += 1
-                await queue.put((url, row.get("category") or "tong-hop"))
+                if not await self._queue_put_safe(
+                    queue, (url, row.get("category") or "tong-hop")
+                ):
+                    break
 
         if pending:
             await self.db.update_source_checkpoint(

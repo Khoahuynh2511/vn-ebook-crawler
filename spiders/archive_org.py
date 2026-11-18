@@ -112,7 +112,10 @@ class BaseArchiveOrgSpider(BaseEbookSpider):
             if url not in queued_set:
                 queued_set.add(url)
                 self.discovered_count += 1
-                await queue.put((url, row.get("category") or self.default_category))
+                if not await self._queue_put_safe(
+                    queue, (url, row.get("category") or self.default_category)
+                ):
+                    break
 
         if self._reached_discovery_cap():
             self.status_message = "Đang tải sách..."

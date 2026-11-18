@@ -66,7 +66,9 @@ class ParallelCrawlEngine:
     async def _run_spider_pipeline(
         self, spider: BaseEbookSpider, client: httpx.AsyncClient
     ) -> None:
-        queue: asyncio.Queue[Optional[Tuple[str, str]]] = asyncio.Queue()
+        queue: asyncio.Queue[Optional[Tuple[str, str]]] = asyncio.Queue(
+            maxsize=max(40, self.config.workers_per_source * 12)
+        )
         worker_count = max(1, self.config.workers_per_source)
         # Polite single-worker limit for crawl-delay heavy sites like isach
         if spider.crawl_delay >= 2.0:
@@ -117,6 +119,10 @@ class ParallelCrawlEngine:
                         async with self._ckpt_lock:
                             ckpt_path = self.config.output_dir / "crawl_progress.json"
                             await self.db.export_progress_checkpoint(ckpt_path)
+                            if spider.processed_count % 30 == 0:
+                                await self._upload_checkpoint_to_gdrive(
+                                    ckpt_path, delete_after=False
+                                )
 
                     if self.config.max_books_per_source > 0:
                         async with completed_lock:
@@ -137,14 +143,16 @@ class ParallelCrawlEngine:
                 spider.name, status_note="Hoàn tất phiên (sẵn sàng chạy tiếp)"
             )
 
-    async def _upload_checkpoint_to_gdrive(self, ckpt_path: Path) -> None:
+    async def _upload_checkpoint_to_gdrive(
+        self, ckpt_path: Path, *, delete_after: bool = True
+    ) -> None:
         if not (self.config.use_gdrive and self.gdrive.is_available and ckpt_path.exists()):
             return
         try:
             root_id = await self.gdrive.ensure_root_folder(self.config.gdrive_root_folder)
             if root_id:
                 fid = await self.gdrive.upload_file(ckpt_path, root_id)
-                if fid and self.config.delete_local_after_upload:
+                if fid and delete_after and self.config.delete_local_after_upload:
                     ckpt_path.unlink(missing_ok=True)
                     try:
                         self.config.output_dir.rmdir()
@@ -333,9 +341,26 @@ class ParallelCrawlEngine:
                             await dash_task
                         live.update(self.build_status_table())
                 else:
-                    await asyncio.gather(
-                        *(self._run_spider_pipeline(sp, client) for sp in self.spiders)
-                    )
+                    async def log_progress_loop() -> None:
+                        ticks = 0
+                        while not stop_refresh.is_set():
+                            await asyncio.sleep(0.5)
+                            ticks += 1
+                            if ticks % 40 == 0 and not stop_refresh.is_set():
+                                summary = " | ".join(
+                                    f"{sp.name}: {sp.epub_count + sp.pdf_count} tải ({sp.gdrive_count} GDrive)"
+                                    for sp in self.spiders
+                                )
+                                print(f"[Tiến trình] {summary}", flush=True)
+
+                    log_task = asyncio.create_task(log_progress_loop())
+                    try:
+                        await asyncio.gather(
+                            *(self._run_spider_pipeline(sp, client) for sp in self.spiders)
+                        )
+                    finally:
+                        stop_refresh.set()
+                        await log_task
                     self.console.print(self.build_status_table())
         except (asyncio.CancelledError, KeyboardInterrupt):
             for sp in self.spiders:
