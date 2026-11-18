@@ -288,14 +288,14 @@ class BaseEbookSpider:
     async def _queue_put_safe(
         self, queue: asyncio.Queue, item: Tuple[str, str]
     ) -> bool:
-        """Enqueue a book with non-blocking backpressure that respects rate_limited_stop."""
+        """Enqueue a book with non-blocking backpressure; abort on QueueFull only if rate-limited."""
         while True:
-            if self._reached_discovery_cap():
-                return False
             try:
                 queue.put_nowait(item)
                 return True
             except asyncio.QueueFull:
+                if self.rate_limited_stop:
+                    return False
                 await asyncio.sleep(0.2)
 
     async def _enqueue_book(
