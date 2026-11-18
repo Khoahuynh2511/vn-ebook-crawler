@@ -37,7 +37,6 @@ ACTIVE_SOURCES: List[str] = [
     "thuviensach",
     "sachhayonline",
     "archive_org",
-    "archive_org_en",
 ]
 
 

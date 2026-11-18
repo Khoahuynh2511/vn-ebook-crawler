@@ -404,8 +404,8 @@ async def test_active_sources_and_retry_backoff(tmp_path: Path, monkeypatch) -> 
         "thuviensach",
         "sachhayonline",
         "archive_org",
-        "archive_org_en",
     }
+    assert resolve_sources("archive_org_en") == ["archive_org_en"]
     assert resolve_sources("isach") == ["isach"]
 
     resp_429 = httpx.Response(429, headers={"Retry-After": "1"}, text="rate limit")
