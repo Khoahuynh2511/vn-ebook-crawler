@@ -1,6 +1,6 @@
 import asyncio
 import re
-from typing import List, Set, Tuple
+from typing import Dict, List, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -75,24 +75,51 @@ class SachHayOnlineSpider(BaseEbookSpider):
             title = soup.title.string.split("|")[0].strip()
 
         book_path = urlparse(res.url).path.rstrip("/")
-        seen_urls: Set[str] = set()
-        raw_chapters: List[Tuple[int, str, str]] = []
+        links = self.extract_ebook_links(soup, res.url, res.text)
+        epub_url = links.get("epub")
+        pdf_url = links.get("pdf")
+
+        # 1. Legacy chapter URLs: /tua-sach/<slug>/<chap>/<id> (sort by trailing numeric ID)
+        seen_legacy: Set[str] = set()
+        raw_legacy: List[Tuple[int, str, str]] = []
+        # 2. Modern chapter URLs: /doc-online/<chap>/<id> (preserve exact DOM TOC order)
+        doc_online_toc: Dict[str, str] = {}
+        doc_online_fallback: List[str] = []
+        seen_fallback: Set[str] = set()
+
         for idx, a in enumerate(soup.find_all("a", href=True)):
             abs_u = urljoin(res.url, a["href"]).split("#")[0]
             chap_path = urlparse(abs_u).path.rstrip("/")
-            if chap_path.startswith(book_path + "/") and abs_u not in seen_urls:
-                seen_urls.add(abs_u)
-                chap_title = a.get_text(" ", strip=True) or f"Chương {len(raw_chapters) + 1}"
-                # Trailing numeric ID preserves exact canonical chapter order
+            link_text = a.get_text(" ", strip=True)
+
+            if chap_path.startswith(book_path + "/") and abs_u not in seen_legacy:
+                seen_legacy.add(abs_u)
+                chap_title = link_text or f"Chương {len(raw_legacy) + 1}"
                 m = re.search(r"/(\d+)$", chap_path)
                 order_key = int(m.group(1)) if m else idx
-                raw_chapters.append((order_key, chap_title, abs_u))
+                raw_legacy.append((order_key, chap_title, abs_u))
+            elif chap_path.startswith("/doc-online/"):
+                is_read_btn = "đọc online" in link_text.lower()
+                if not is_read_btn and link_text:
+                    if abs_u not in doc_online_toc:
+                        doc_online_toc[abs_u] = link_text
+                elif abs_u not in seen_fallback:
+                    seen_fallback.add(abs_u)
+                    doc_online_fallback.append(abs_u)
 
-        raw_chapters.sort(key=lambda x: x[0])
-        chap_links = [(t, u) for _, t, u in raw_chapters]
+        chap_links: List[Tuple[str, str]] = []
+        if raw_legacy:
+            raw_legacy.sort(key=lambda x: x[0])
+            chap_links = [(t, u) for _, t, u in raw_legacy]
+        elif doc_online_toc or doc_online_fallback:
+            chap_links = [(t, u) for u, t in doc_online_toc.items()]
+            for u in doc_online_fallback:
+                if u not in doc_online_toc:
+                    chap_links.append((f"Chương {len(chap_links) + 1}", u))
+
         chapters = (
             await self._fetch_chapters(client, chap_links, res.url)
-            if chap_links and "epub" in self.config.formats
+            if chap_links and not epub_url and "epub" in self.config.formats
             else []
         )
 
@@ -111,6 +138,8 @@ class SachHayOnlineSpider(BaseEbookSpider):
             url=res.url,
             title=title or slugify_filename(book_path),
             category=cat,
+            epub_url=epub_url,
+            pdf_url=pdf_url,
             chapters=chapters,
         )
 

@@ -862,7 +862,7 @@ class BaseEbookSpider:
             clear_local_paths=cleared_local,
             error="; ".join(errors) if errors else None,
         )
-        if final_status == "completed":
+        if final_status == "completed" and not self.rate_limited_stop:
             await self.db.update_source_checkpoint(
                 self.name,
                 last_book_url=book.url,

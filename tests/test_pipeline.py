@@ -782,3 +782,65 @@ async def test_archive_org_selection_and_discovery(tmp_path: Path) -> None:
         assert bd.epub_url == "https://archive.org/download/tu-dien-tieng-viet/Tu%20dien%20%281%29.epub"
     finally:
         db.close()
+
+
+def test_sachhayonline_doc_online_and_direct_pdf(tmp_path):
+    import asyncio
+    from config import CrawlerConfig
+    from storage import CatalogDB
+    from spiders.base import FetchResult
+    from spiders.chapter_sites import SachHayOnlineSpider
+
+    book_doc_url = "https://sachhayonline.com/tua-sach/sach-moi"
+    chap_0_url = "https://sachhayonline.com/doc-online/dan-nhap/100"
+    chap_1_url = "https://sachhayonline.com/doc-online/chuong-1/133330"
+    chap_6_url = "https://sachhayonline.com/doc-online/chuong-6/132562"
+    book_pdf_url = "https://sachhayonline.com/tua-sach/sach-pdf-moi"
+
+    pages = {
+        book_doc_url: """
+        <html><body>
+          <h1>Sách Mới Doc Online</h1>
+          <a href="/doc-online/chuong-1/133330">⭐ Đọc Online</a>
+          <ul class="toc">
+            <li><a href="/doc-online/dan-nhap/100">Dẫn Nhập</a></li>
+            <li><a href="/doc-online/chuong-1/133330">Chương 1</a></li>
+            <li><a href="/doc-online/chuong-6/132562">Chương 6</a></li>
+          </ul>
+        </body></html>
+        """,
+        chap_0_url: '<html><body><div class="chapter-content"><p>Nội dung dẫn nhập đầy đủ để kiểm tra.</p></div></body></html>',
+        chap_1_url: '<html><body><div class="chapter-content"><p>Nội dung chương một đầy đủ để kiểm tra.</p></div></body></html>',
+        chap_6_url: '<html><body><div class="chapter-content"><p>Nội dung chương sáu đầy đủ để kiểm tra.</p></div></body></html>',
+        book_pdf_url: """
+        <html><body>
+          <h1>Sách PDF Mới</h1>
+          <a href="/uploads/books/pdf/test-123.pdf">PDF</a>
+        </body></html>
+        """,
+    }
+
+    class FakeClient:
+        async def get(self, url, **kwargs):
+            return FetchResult(url=url, status_code=200, text=pages[url])
+
+        async def fetch(self, url, **kwargs):
+            return FetchResult(url=url, status_code=200, text=pages[url])
+
+    db = CatalogDB(tmp_path / "catalog.db")
+    try:
+        cfg = CrawlerConfig(output_dir=tmp_path)
+        spider = SachHayOnlineSpider(cfg, db)
+        client = FakeClient()
+
+        bd1 = asyncio.run(spider.parse_book(client, book_doc_url, "Văn học"))
+        assert len(bd1.chapters) == 3
+        assert [title for title, _ in bd1.chapters] == ["Dẫn Nhập", "Chương 1", "Chương 6"]
+        assert "Nội dung dẫn nhập" in bd1.chapters[0][1]
+        assert "Nội dung chương một" in bd1.chapters[1][1]
+        assert "Nội dung chương sáu" in bd1.chapters[2][1]
+
+        bd2 = asyncio.run(spider.parse_book(client, book_pdf_url, "Triết học"))
+        assert bd2.pdf_url == "https://sachhayonline.com/uploads/books/pdf/test-123.pdf"
+    finally:
+        db.close()
