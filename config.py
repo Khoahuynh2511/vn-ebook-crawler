@@ -26,10 +26,19 @@ SOURCE_MIRRORS: Dict[str, List[str]] = {
     "thuviensach": ["https://thuviensach.vn"],
     "isach": ["https://isach.info"],
     "sachhayonline": ["https://www.sachhayonline.com", "https://sachhayonline.com"],
+    "archive_org": ["https://archive.org"],
+    "archive_org_en": ["https://archive.org"],
 }
 
 ALL_SOURCES: List[str] = list(SOURCE_MIRRORS.keys())
-ACTIVE_SOURCES: List[str] = ["sach_gallery", "metaisach", "thuviensach", "sachhayonline"]
+ACTIVE_SOURCES: List[str] = [
+    "sach_gallery",
+    "metaisach",
+    "thuviensach",
+    "sachhayonline",
+    "archive_org",
+    "archive_org_en",
+]
 
 
 @dataclass

@@ -13,11 +13,13 @@ pip install -r requirements.txt
 - Dùng `--no-katana` để chuyển về chế độ quét Python thuần, `--katana-depth N` để chỉnh độ sâu crawl, hoặc `--katana-headless` để bật chế độ headless (`-hl`) cho trang render bằng JS.
 
 ## Nguồn sách hỗ trợ
-Khi chạy `--sources all` (mặc định), crawler tập trung vào **4 nguồn hiệu quả** (`ACTIVE_SOURCES`):
-- `sach_gallery` (`www.sach.gallery`) — Kho EPUB chọn lọc chất lượng cao, tải trực tiếp `/tai/<id>` (lưu ý giới hạn 20 lượt tải `/tai/` mỗi ngày/IP) và đọc chương `/doc/`.
+Khi chạy `--sources all` (mặc định), crawler tập trung vào **6 nguồn mở hiệu quả** (`ACTIVE_SOURCES`):
+- `sach_gallery` (`www.sach.gallery`) — Kho EPUB chọn lọc chất lượng cao, tải trực tiếp `/tai/<id>` (lưu ý giới hạn 20 lượt tải `/tai/` mỗi ngày/IP; tự lưu điểm dừng khi đạt hạn mức).
 - `metaisach` (`metaisach.com`) — Kho PDF/EPUB đồ sộ (hơn 8.200 đầu sách tải thẳng từ `media.metaisach.com`).
 - `thuviensach` (`thuviensach.vn`) — Thư viện ebook tổng hợp (ưu tiên các chuyên mục có link EPUB/PDF trực tiếp).
 - `sachhayonline` (`www.sachhayonline.com`) — Sách văn học, lịch sử, kỹ năng theo chương; tự động gom chương đóng gói thành file `.epub`.
+- `archive_org` (`archive.org`) — Hơn **11.200** sách & tài liệu tiếng Việt mở (EPUB/PDF không DRM) qua JSON API chính thức của Internet Archive.
+- `archive_org_en` (`archive.org`) — Hơn **731.500** đầu sách tiếng Anh mở (EPUB/PDF không DRM) qua JSON API chính thức của Internet Archive.
 
 *(Các adapter cũ không còn khả dụng hoặc bị chặn Cloudflare/CAPTCHA như `isach`, `sachvui`, `nhasachmienphi`, `dtv_ebook` vẫn được giữ trong mã nguồn nếu muốn gọi đích danh qua `--sources`, nhưng mặc định được bỏ qua).*
 

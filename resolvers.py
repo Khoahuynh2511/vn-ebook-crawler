@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 from typing import Optional, Tuple
 from urllib.parse import urljoin
+import uuid
 
 import aiofiles
 from bs4 import BeautifulSoup
@@ -163,7 +164,14 @@ class FileDownloader:
             return False, False
 
         dest_path.parent.mkdir(parents=True, exist_ok=True)
-        part_path = dest_path.with_suffix(f".{expected_ext.lstrip('.')}.part")
+        part_path = dest_path.with_name(f"{dest_path.name}.{uuid.uuid4().hex[:8]}.part")
+        stream_timeout = httpx.Timeout(120.0, connect=20.0, read=60.0)
+
+        def _cleanup_part() -> None:
+            try:
+                part_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
         req_headers = {}
         if referer:
@@ -172,7 +180,7 @@ class FileDownloader:
         for attempt in range(retries + 1):
             try:
                 async with client.stream(
-                    "GET", resolved_url, headers=req_headers, timeout=90.0
+                    "GET", resolved_url, headers=req_headers, timeout=stream_timeout
                 ) as resp:
                     if resp.status_code == 429:
                         ctype = resp.headers.get("content-type", "").lower()
@@ -203,17 +211,15 @@ class FileDownloader:
                 if not validate_file_header(part_path, expected_ext):
                     return False, False
 
-                if dest_path.exists():
-                    dest_path.unlink()
-                part_path.rename(dest_path)
+                part_path.replace(dest_path)
                 return True, False
             except (httpx.HTTPError, OSError):
-                part_path.unlink(missing_ok=True)
+                _cleanup_part()
                 if attempt < retries:
                     await asyncio.sleep(1.5 * (2**attempt) + random.uniform(0.2, 0.8))
                     continue
                 return False, False
             except Exception:
-                part_path.unlink(missing_ok=True)
+                _cleanup_part()
                 return False, False
         return False, False

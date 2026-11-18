@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
         default="all",
         help=(
             "Danh sách nguồn cách nhau bởi dấu phẩy hoặc 'all'. "
-            f"Mặc định 'all' chạy 4 nguồn hiệu quả: {','.join(ACTIVE_SOURCES)}"
+            f"Mặc định 'all' chạy {len(ACTIVE_SOURCES)} nguồn hiệu quả: {','.join(ACTIVE_SOURCES)}"
         ),
     )
     parser.add_argument(

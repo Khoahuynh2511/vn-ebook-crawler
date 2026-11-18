@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import random
 import re
@@ -668,31 +669,48 @@ class BaseEbookSpider:
         cat_slug = slugify_filename(book.category or category or "tong-hop", max_len=40)
         book_slug = slugify_filename(book.title or urlparse(url).path, max_len=80)
         book_dir = self.config.output_dir / self.name / cat_slug
-        book_dir.mkdir(parents=True, exist_ok=True)
+        use_isolated_staging = bool(
+            self.config.use_gdrive
+            and gdrive is not None
+            and gdrive.is_available
+            and self.config.delete_local_after_upload
+        )
+        url_hash = hashlib.md5(url.encode("utf-8")).hexdigest()[:8]
+        stage_dir = (book_dir / f"_st_{url_hash}") if use_isolated_staging else book_dir
+
+        if book.epub_url or book.pdf_url or book.chapters:
+            stage_dir.mkdir(parents=True, exist_ok=True)
 
         epub_path_str: Optional[str] = None
         pdf_path_str: Optional[str] = None
         errors: List[str] = []
 
+        def _prune_empty_dirs() -> None:
+            for d in (stage_dir, book_dir, book_dir.parent):
+                try:
+                    d.rmdir()
+                except OSError:
+                    pass
+
         async def _download_with_status(
             dl_url: str, dest: Path, ext: str
         ) -> Tuple[bool, bool]:
-            async with download_sem:
-                if hasattr(downloader, "download_book_with_status"):
-                    return await downloader.download_book_with_status(
+            try:
+                async with download_sem:
+                    if hasattr(downloader, "download_book_with_status"):
+                        return await downloader.download_book_with_status(
+                            client, dl_url, dest, ext, referer=book.url
+                        )
+                    ok = await downloader.download_book_file(
                         client, dl_url, dest, ext, referer=book.url
                     )
-                ok = await downloader.download_book_file(
-                    client, dl_url, dest, ext, referer=book.url
-                )
-                return ok, False
+                    return ok, False
+            except Exception as exc:
+                errors.append(f"{type(exc).__name__}: {exc}")
+                return False, False
 
         async def _handle_rate_limit() -> None:
-            for empty_dir in (book_dir, book_dir.parent):
-                try:
-                    empty_dir.rmdir()
-                except OSError:
-                    pass
+            _prune_empty_dirs()
             await self.db.reset_rate_limited_to_pending(url)
             self.rate_limited_stop = True
             self.status_message = "Đạt hạn mức ngày (đã lưu điểm dừng)"
@@ -705,7 +723,7 @@ class BaseEbookSpider:
 
         # Download EPUB if requested and available
         if "epub" in self.config.formats:
-            dest_epub = book_dir / f"{book_slug}.epub"
+            dest_epub = stage_dir / f"{book_slug}.epub"
             if book.epub_url:
                 ok, rate_limited = await _download_with_status(
                     book.epub_url, dest_epub, "epub"
@@ -735,7 +753,7 @@ class BaseEbookSpider:
 
         # Download PDF only if EPUB was not obtained (prefer EPUB when both exist)
         if "pdf" in self.config.formats and book.pdf_url and not epub_path_str:
-            dest_pdf = book_dir / f"{book_slug}.pdf"
+            dest_pdf = stage_dir / f"{book_slug}.pdf"
             ok, rate_limited = await _download_with_status(
                 book.pdf_url, dest_pdf, "pdf"
             )
@@ -756,7 +774,7 @@ class BaseEbookSpider:
         primary_path_str = epub_path_str or pdf_path_str
         if primary_path_str:
             primary_path = Path(primary_path_str)
-            meta_path = book_dir / f"{book_slug}.meta.json"
+            meta_path = stage_dir / f"{book_slug}.meta.json"
             if self.config.use_gdrive and gdrive is not None and gdrive.is_available:
                 try:
                     cat_folder_id = await gdrive.ensure_category_folder(
@@ -768,13 +786,12 @@ class BaseEbookSpider:
                             gdrive_url = gdrive_file_url(gdrive_id)
                             self.gdrive_count += 1
                             if self.config.delete_local_after_upload:
-                                primary_path.unlink(missing_ok=True)
-                                meta_path.unlink(missing_ok=True)
-                                for empty_dir in (book_dir, book_dir.parent):
-                                    try:
-                                        empty_dir.rmdir()
-                                    except OSError:
-                                        pass
+                                try:
+                                    primary_path.unlink(missing_ok=True)
+                                    meta_path.unlink(missing_ok=True)
+                                except OSError:
+                                    pass
+                                _prune_empty_dirs()
                                 cleared_local = True
                                 epub_path_str = None
                                 pdf_path_str = None
@@ -800,6 +817,8 @@ class BaseEbookSpider:
                     json.dumps(meta_payload, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
+        else:
+            _prune_empty_dirs()
 
         if not file_fmt:
             if not book.epub_url and not book.pdf_url and not book.chapters:

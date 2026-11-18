@@ -13,6 +13,7 @@ from gdrive_uploader import GDriveUploader, gdrive_file_url
 from katana_runner import KatanaDiscovery
 from main import resolve_sources
 from resolvers import FileDownloader, _parse_retry_after, extract_gdrive_id, validate_file_header
+from spiders.archive_org import ArchiveOrgEnglishSpider, ArchiveOrgSpider, select_best_archive_files
 from spiders.base import BaseEbookSpider, BookData, is_captcha_or_blocked
 from spiders.chapter_sites import SachHayOnlineSpider
 from spiders.sach_gallery import SachGallerySpider
@@ -402,6 +403,8 @@ async def test_active_sources_and_retry_backoff(tmp_path: Path, monkeypatch) -> 
         "metaisach",
         "thuviensach",
         "sachhayonline",
+        "archive_org",
+        "archive_org_en",
     }
     assert resolve_sources("isach") == ["isach"]
 
@@ -688,5 +691,94 @@ async def test_resume_cursor_and_rate_limit_pause(tmp_path: Path) -> None:
         ckpt = await db.export_progress_checkpoint(tmp_path / "crawl_progress.json")
         assert "sach_gallery" in ckpt["resume_cursors"]
         assert ckpt["resume_cursors"]["sach_gallery"]["next_pending_urls"][0] == rl_url
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_archive_org_selection_and_discovery(tmp_path: Path) -> None:
+    import json
+    from spiders.base import FetchResult
+
+    # 1. Filters out private & DRM-encrypted files; keeps compact EPUB
+    files_clean_epub = [
+        {"name": "book.epub", "size": "3182967", "source": "derivative", "format": "EPUB"},
+        {"name": "book_encrypted.epub", "size": "200000", "source": "original", "format": "ACS Encrypted EPUB"},
+        {"name": "secret.pdf", "size": "5000000", "private": "true", "format": "Text PDF"},
+        {"name": "book.pdf", "size": "5000000", "source": "original", "format": "Text PDF"},
+    ]
+    epub_f, pdf_f = select_best_archive_files(files_clean_epub, allow_pdf=True)
+    assert epub_f == "book.epub"
+    assert pdf_f == "book.pdf"
+
+    # 2. Avoids 198MB bloated scanned derivative EPUB when compact original PDF is available
+    files_bloated_epub = [
+        {"name": "scan.epub", "size": "198085816", "source": "derivative", "format": "EPUB"},
+        {"name": "scan.pdf", "size": "4844385", "source": "original", "format": "Text PDF"},
+    ]
+    epub_f2, pdf_f2 = select_best_archive_files(files_bloated_epub, allow_pdf=True)
+    assert epub_f2 is None
+    assert pdf_f2 == "scan.pdf"
+
+    # 3. Skips all private/lcp files cleanly
+    files_locked = [
+        {"name": "locked.epub", "size": "500000", "private": True, "format": "EPUB"},
+        {"name": "locked_lcp.epub", "size": "500000", "format": "LCP Encrypted EPUB"},
+    ]
+    assert select_best_archive_files(files_locked) == (None, None)
+
+    # 4. Spider discovery & metadata parsing with URL-encoded spaces
+    cfg = CrawlerConfig(output_dir=tmp_path / "dl", db_path=tmp_path / "cat.db", max_books_per_source=1, use_gdrive=False)
+    db = CatalogDB(cfg.db_path)
+    try:
+        sp = ArchiveOrgEnglishSpider(cfg, db)
+        assert sp.name == "archive_org_en"
+
+        sp_vi = ArchiveOrgSpider(cfg, db)
+        search_json = json.dumps(
+            {
+                "response": {
+                    "docs": [
+                        {
+                            "identifier": "tu-dien-tieng-viet",
+                            "title": "Từ điển tiếng Việt",
+                            "creator": "Hoàng Phê",
+                            "subject": ["Dictionaries", "Vietnamese"],
+                        }
+                    ]
+                }
+            }
+        )
+        meta_json = json.dumps(
+            {
+                "metadata": {
+                    "title": "Từ điển tiếng Việt",
+                    "creator": ["Hoàng Phê"],
+                    "subject": "Dictionaries; Vietnamese",
+                },
+                "files": [
+                    {"name": "Tu dien (1).epub", "size": "3182967", "source": "derivative", "format": "EPUB"}
+                ],
+            }
+        )
+
+        async def _fake_fetch(client, url: str, **kwargs):
+            if "advancedsearch.php" in url:
+                return FetchResult(url=url, status_code=200, text=search_json)
+            if "/metadata/" in url:
+                return FetchResult(url=url, status_code=200, text=meta_json)
+            return FetchResult(url=url, status_code=404, text="")
+
+        sp_vi.fetch_html = _fake_fetch
+        q: asyncio.Queue = asyncio.Queue()
+        await sp_vi.discover_books(None, q)
+        assert q.qsize() == 1
+        book_url, cat = await q.get()
+        assert book_url == "https://archive.org/details/tu-dien-tieng-viet"
+
+        bd = await sp_vi.parse_book(None, book_url, cat)
+        assert bd.title == "Từ điển tiếng Việt"
+        assert bd.author == "Hoàng Phê"
+        assert bd.epub_url == "https://archive.org/download/tu-dien-tieng-viet/Tu%20dien%20%281%29.epub"
     finally:
         db.close()
