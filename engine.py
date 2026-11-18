@@ -1,6 +1,8 @@
 import asyncio
+import json
 import sys
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from rich.console import Console
@@ -8,8 +10,10 @@ from rich.live import Live
 from rich.table import Table
 
 from config import DEFAULT_HEADERS, CrawlerConfig
+from gdrive_uploader import GDriveUploader, gdrive_file_url
 from resolvers import FileDownloader
 from spiders import SPIDER_REGISTRY, BaseEbookSpider
+from spiders.base import slugify_filename
 from storage import CatalogDB
 
 
@@ -21,6 +25,9 @@ class ParallelCrawlEngine:
         self.source_names = source_names
         self.db = CatalogDB(config.db_path)
         self.downloader = FileDownloader()
+        self.gdrive = GDriveUploader(
+            self.db, root_folder_id=config.gdrive_root_id
+        )
         self.download_sem = asyncio.Semaphore(config.download_concurrency)
         self.console = Console()
         self.spiders: List[BaseEbookSpider] = [
@@ -37,6 +44,7 @@ class ParallelCrawlEngine:
         table.add_column("Đã xử lý", justify="right")
         table.add_column("EPUB", justify="right", style="green")
         table.add_column("PDF", justify="right", style="blue")
+        table.add_column("GDrive", justify="right", style="bright_green")
         table.add_column("Lỗi/Chặn", justify="right", style="red")
         table.add_column("Trạng thái", style="yellow")
 
@@ -48,6 +56,7 @@ class ParallelCrawlEngine:
                 str(sp.processed_count),
                 str(sp.epub_count),
                 str(sp.pdf_count),
+                str(sp.gdrive_count),
                 str(sp.failed_count),
                 sp.status_message,
             )
@@ -92,7 +101,12 @@ class ParallelCrawlEngine:
                                 continue
 
                     await spider.process_book(
-                        client, self.downloader, self.download_sem, book_url, category
+                        client,
+                        self.downloader,
+                        self.download_sem,
+                        book_url,
+                        category,
+                        gdrive=self.gdrive if self.config.use_gdrive else None,
                     )
 
                     if self.config.max_books_per_source > 0:
@@ -111,6 +125,142 @@ class ParallelCrawlEngine:
         if not spider.status_message.startswith("Bị chặn") and not spider.status_message.startswith("Không thể"):
             spider.status_message = "Hoàn tất"
 
+    async def _upload_checkpoint_to_gdrive(self, ckpt_path: Path) -> None:
+        if not (self.config.use_gdrive and self.gdrive.is_available and ckpt_path.exists()):
+            return
+        try:
+            root_id = await self.gdrive.ensure_root_folder(self.config.gdrive_root_folder)
+            if root_id:
+                fid = await self.gdrive.upload_file(ckpt_path, root_id)
+                if fid and self.config.delete_local_after_upload:
+                    ckpt_path.unlink(missing_ok=True)
+                    try:
+                        self.config.output_dir.rmdir()
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+
+    async def sync_existing_books_to_gdrive(self) -> int:
+        """Upload all previously downloaded local books in catalog.db that lack gdrive_id."""
+        self.config.output_dir.mkdir(parents=True, exist_ok=True)
+        uploaded_count = 0
+        try:
+            if not self.config.use_gdrive:
+                self.console.print("[yellow]Google Drive đang tắt (--no-gdrive).[/yellow]")
+                return 0
+            if not self.gdrive.is_available:
+                self.console.print(
+                    "[red]Không tìm thấy công cụ gdrive CLI. Hãy kiểm tra plugin Google Drive.[/red]"
+                )
+                return 0
+
+            root_id = await self.gdrive.ensure_root_folder(self.config.gdrive_root_folder)
+            if not root_id:
+                self.console.print("[red]Không thể tạo/mở thư mục gốc trên Google Drive.[/red]")
+                return 0
+
+            unsynced = await self.db.get_unsynced_completed_books(
+                sources=self.source_names or None
+            )
+            if not unsynced:
+                self.console.print(
+                    "[green]Tất cả sách đã tải trong thư viện đều đã được đồng bộ lên Google Drive.[/green]"
+                )
+                ckpt_path = self.config.output_dir / "crawl_progress.json"
+                await self.db.export_progress_checkpoint(ckpt_path)
+                await self._upload_checkpoint_to_gdrive(ckpt_path)
+                return 0
+
+            self.console.print(
+                f"[cyan]Đang đồng bộ {len(unsynced)} đầu sách hiện có lên Google Drive "
+                f"(thư mục '{self.config.gdrive_root_folder}')...[/cyan]"
+            )
+
+            count_lock = asyncio.Lock()
+
+            async def _sync_one(row: Dict[str, Any]) -> None:
+                nonlocal uploaded_count
+                primary_str = row.get("epub_path") or row.get("pdf_path")
+                if not primary_str:
+                    return
+                primary_path = Path(primary_str)
+                if not primary_path.exists():
+                    return
+
+                source = row["source"]
+                file_fmt = row.get("file_format") or (
+                    "epub" if row.get("epub_path") else "pdf"
+                )
+                cat_slug = (
+                    primary_path.parent.name
+                    if primary_path.parent.parent.name == source
+                    else slugify_filename(row.get("category") or "tong-hop", max_len=40)
+                )
+                try:
+                    cat_folder_id = await self.gdrive.ensure_category_folder(
+                        self.config.gdrive_root_folder, source, cat_slug
+                    )
+                    if not cat_folder_id:
+                        return
+                    gdrive_id = await self.gdrive.upload_file(primary_path, cat_folder_id)
+                    if not gdrive_id:
+                        return
+                    gdrive_url = gdrive_file_url(gdrive_id)
+                    meta_path = primary_path.with_suffix(".meta.json")
+                    cleared_local = False
+                    if self.config.delete_local_after_upload:
+                        primary_path.unlink(missing_ok=True)
+                        meta_path.unlink(missing_ok=True)
+                        for empty_dir in (primary_path.parent, primary_path.parent.parent):
+                            try:
+                                empty_dir.rmdir()
+                            except OSError:
+                                pass
+                        cleared_local = True
+                    elif meta_path.exists():
+                        try:
+                            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                            meta["gdrive_id"] = gdrive_id
+                            meta["gdrive_url"] = gdrive_url
+                            meta_path.write_text(
+                                json.dumps(meta, ensure_ascii=False, indent=2),
+                                encoding="utf-8",
+                            )
+                        except Exception:
+                            pass
+
+                    await self.db.update_book_result(
+                        row["url"],
+                        status=row["status"],
+                        file_format=file_fmt,
+                        gdrive_id=gdrive_id,
+                        gdrive_url=gdrive_url,
+                        clear_local_paths=cleared_local,
+                    )
+                    async with count_lock:
+                        uploaded_count += 1
+                        if uploaded_count % 10 == 0 or uploaded_count == len(unsynced):
+                            self.console.print(
+                                f"  [green]Đã đẩy {uploaded_count}/{len(unsynced)} sách lên Google Drive...[/green]"
+                            )
+                except Exception as exc:
+                    self.console.print(
+                        f"[yellow]Lỗi upload {primary_path.name}: {exc}[/yellow]"
+                    )
+
+            await asyncio.gather(*(_sync_one(r) for r in unsynced))
+
+            ckpt_path = self.config.output_dir / "crawl_progress.json"
+            await self.db.export_progress_checkpoint(ckpt_path)
+            await self._upload_checkpoint_to_gdrive(ckpt_path)
+            self.console.print(
+                f"[green]Đã đồng bộ thành công {uploaded_count}/{len(unsynced)} sách lên Google Drive![/green]"
+            )
+            return uploaded_count
+        finally:
+            self.db.close()
+
     async def run(
         self,
         *,
@@ -128,6 +278,14 @@ class ParallelCrawlEngine:
             if reset_discovery:
                 for src in self.source_names:
                     await self.db.clear_visited_pages(src)
+
+            if self.config.use_gdrive:
+                if self.gdrive.is_available:
+                    await self.gdrive.ensure_root_folder(self.config.gdrive_root_folder)
+                else:
+                    self.console.print(
+                        "[yellow]Cảnh báo: Không tìm thấy gdrive CLI, sách tạm thời chỉ lưu ở thư mục cục bộ.[/yellow]"
+                    )
 
             async with httpx.AsyncClient(
                 headers=DEFAULT_HEADERS,
@@ -175,8 +333,8 @@ class ParallelCrawlEngine:
         finally:
             try:
                 await self.db.reset_interrupted_books()
-                await self.db.export_progress_checkpoint(
-                    self.config.output_dir / "crawl_progress.json"
-                )
+                ckpt_path = self.config.output_dir / "crawl_progress.json"
+                await self.db.export_progress_checkpoint(ckpt_path)
+                await self._upload_checkpoint_to_gdrive(ckpt_path)
             finally:
                 self.db.close()

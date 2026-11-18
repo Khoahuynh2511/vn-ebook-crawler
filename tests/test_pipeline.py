@@ -9,6 +9,7 @@ import pytest
 
 from config import ACTIVE_SOURCES, CrawlerConfig
 from epub_builder import build_epub_from_chapters
+from gdrive_uploader import GDriveUploader, gdrive_file_url
 from katana_runner import KatanaDiscovery
 from main import resolve_sources
 from resolvers import FileDownloader, _parse_retry_after, extract_gdrive_id, validate_file_header
@@ -448,5 +449,112 @@ async def test_active_sources_and_retry_backoff(tmp_path: Path, monkeypatch) -> 
         assert calls == 2
         assert any(s >= 1.0 for s in sleep_calls)
         assert spider.adaptive_delay >= 0.4 - 1e-6  # +0.5 on 429, -0.1 on 200 OK
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_gdrive_uploader_and_book_sync(tmp_path: Path, monkeypatch) -> None:
+    fake_bin = tmp_path / "gdrive.cmd"
+    fake_bin.write_text("@echo off\n", encoding="utf-8")
+
+    cfg = CrawlerConfig(
+        output_dir=tmp_path / "Books",
+        db_path=tmp_path / "catalog.db",
+        formats={"epub", "pdf"},
+        use_gdrive=True,
+        gdrive_root_folder="Books",
+        delete_local_after_upload=True,
+    )
+    db = CatalogDB(cfg.db_path)
+    try:
+        uploader = GDriveUploader(db, bin_path=fake_bin)
+        assert uploader.is_available is True
+
+        cli_calls = []
+
+        async def _mock_cli(*args, **kwargs):
+            cli_calls.append(args)
+            if args[:2] == ("readonly", "search"):
+                return []
+            if args[:2] == ("mutate", "mkdir"):
+                folder_name = args[2]
+                return {"id": f"fld_{folder_name}", "name": folder_name}
+            if args[:2] == ("mutate", "upload"):
+                return {"id": "file_12345", "name": Path(args[2]).name}
+            if args[:2] == ("mutate", "update"):
+                return {"id": args[2], "name": Path(args[3]).name}
+            return None
+
+        monkeypatch.setattr(uploader, "_run_cli", _mock_cli)
+
+        # Ensure pre-existing unsynced query works
+        unsynced_url = "https://example.com/sach/local-only"
+        local_pdf = tmp_path / "Books" / "metaisach" / "cat" / "local.pdf"
+        local_pdf.parent.mkdir(parents=True, exist_ok=True)
+        local_pdf.write_bytes(b"%PDF-1.7\n" + b"0" * 1200)
+        await db.upsert_discovered_book(unsynced_url, "metaisach", category="cat")
+        await db.update_book_result(
+            unsynced_url,
+            status="completed",
+            title="Sách Cục Bộ",
+            pdf_path=str(local_pdf),
+        )
+        unsynced = await db.get_unsynced_completed_books()
+        assert [r["url"] for r in unsynced] == [unsynced_url]
+
+        # Test process_book auto-uploading to Google Drive & cleaning up local file
+        spider = BaseEbookSpider(cfg, db)
+        book_url = "https://example.com/sach/cloud-book"
+        await db.upsert_discovered_book(book_url, "base", category="van-hoc")
+        spider.parse_book = AsyncMock(
+            return_value=BookData(
+                url=book_url,
+                title="Sách Lên Drive",
+                category="van-hoc",
+                epub_url="https://example.com/cloud-book.epub",
+            )
+        )
+
+        class _FakeDownloader:
+            async def download_book_file(
+                self, client, url: str, dest: Path, expected_type: str, referer=None
+            ) -> bool:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(b"PK\x03\x04" + b"0" * 1200)
+                return True
+
+        sem = asyncio.Semaphore(1)
+        await spider.process_book(
+            None, _FakeDownloader(), sem, book_url, "van-hoc", gdrive=uploader
+        )
+
+        assert spider.epub_count == 1
+        assert spider.gdrive_count == 1
+
+        # Verify folder hierarchy cache in DB
+        assert await db.get_gdrive_folder_id("root/Books") == "fld_Books"
+        assert await db.get_gdrive_folder_id("fld_Books/base") == "fld_base"
+        assert await db.get_gdrive_folder_id("fld_base/van-hoc") == "fld_van-hoc"
+
+        # Verify DB row stores gdrive_id/url, clears local paths, and keeps epub count via file_format
+        row = db._conn.execute(
+            "SELECT epub_path, pdf_path, file_format, gdrive_id, gdrive_url FROM books WHERE url = ?",
+            (book_url,),
+        ).fetchone()
+        assert row["gdrive_id"] == "file_12345"
+        assert row["gdrive_url"] == gdrive_file_url("file_12345")
+        assert row["file_format"] == "epub"
+        assert row["epub_path"] is None
+        assert row["pdf_path"] is None
+        assert not (tmp_path / "Books" / "base").exists()
+
+        # Verify is_book_already_done remains True when gdrive_id exists despite no local file
+        assert await db.is_book_already_done(book_url) is True
+
+        stats = await db.get_summary_stats()
+        assert stats["base"]["epubs"] == 1
+        assert stats["base"]["gdrive_count"] == 1
+        assert stats["metaisach"]["gdrive_count"] == 0
     finally:
         db.close()

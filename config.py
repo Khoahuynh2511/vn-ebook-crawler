@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Set
+import tempfile
+from typing import Dict, List, Optional, Set
 
 DEFAULT_HEADERS: Dict[str, str] = {
     "User-Agent": (
@@ -33,7 +34,9 @@ ACTIVE_SOURCES: List[str] = ["sach_gallery", "metaisach", "thuviensach", "sachha
 
 @dataclass
 class CrawlerConfig:
-    output_dir: Path = Path(r"D:\Books")
+    output_dir: Path = field(
+        default_factory=lambda: Path(tempfile.gettempdir()) / "vn-ebook-staging"
+    )
     db_path: Path = Path(r"D:\vn-ebook-crawler\catalog.db")
     formats: Set[str] = field(default_factory=lambda: {"epub", "pdf"})
     workers_per_source: int = 5
@@ -47,3 +50,7 @@ class CrawlerConfig:
     katana_depth: int = 2
     katana_headless: bool = False
     katana_bin: Path = Path(r"D:\vn-ebook-crawler\bin\katana.exe")
+    use_gdrive: bool = True
+    gdrive_root_folder: str = "Books"
+    gdrive_root_id: Optional[str] = None
+    delete_local_after_upload: bool = True

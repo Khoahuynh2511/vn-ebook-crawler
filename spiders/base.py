@@ -13,6 +13,7 @@ import httpx
 
 from config import CrawlerConfig
 from epub_builder import build_epub_from_chapters
+from gdrive_uploader import GDriveUploader, gdrive_file_url
 from katana_runner import KatanaDiscovery
 from resolvers import FileDownloader, _parse_retry_after, validate_file_header
 from storage import CatalogDB
@@ -106,6 +107,7 @@ class BaseEbookSpider:
         self.processed_count: int = 0
         self.epub_count: int = 0
         self.pdf_count: int = 0
+        self.gdrive_count: int = 0
         self.failed_count: int = 0
         self.adaptive_delay: float = 0.0
 
@@ -549,8 +551,9 @@ class BaseEbookSpider:
         download_sem: asyncio.Semaphore,
         url: str,
         category: str,
+        gdrive: Optional[GDriveUploader] = None,
     ) -> None:
-        """Parse a book, download EPUB/PDF (or compile chapters), save metadata, update DB."""
+        """Parse a book, download EPUB/PDF (or compile chapters), upload to Google Drive, update DB."""
         await self.db.mark_processing(url)
         try:
             book = await self.parse_book(client, url, category)
@@ -619,28 +622,60 @@ class BaseEbookSpider:
             else:
                 errors.append("pdf_download_failed")
 
-        # Save metadata JSON beside downloaded books
-        if epub_path_str or pdf_path_str:
+        # Upload primary book file to Google Drive & optionally remove staging copy
+        gdrive_id: Optional[str] = None
+        gdrive_url: Optional[str] = None
+        file_fmt: Optional[str] = "epub" if epub_path_str else ("pdf" if pdf_path_str else None)
+        cleared_local = False
+        primary_path_str = epub_path_str or pdf_path_str
+        if primary_path_str:
+            primary_path = Path(primary_path_str)
             meta_path = book_dir / f"{book_slug}.meta.json"
-            meta_payload = {
-                "url": book.url,
-                "source": self.name,
-                "title": book.title,
-                "author": book.author,
-                "category": book.category,
-                "description": book.description,
-                "epub_url": book.epub_url,
-                "pdf_url": book.pdf_url,
-                "epub_path": epub_path_str,
-                "pdf_path": pdf_path_str,
-            }
-            meta_path.write_text(
-                json.dumps(meta_payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            if self.config.use_gdrive and gdrive is not None and gdrive.is_available:
+                try:
+                    cat_folder_id = await gdrive.ensure_category_folder(
+                        self.config.gdrive_root_folder, self.name, cat_slug
+                    )
+                    if cat_folder_id:
+                        gdrive_id = await gdrive.upload_file(primary_path, cat_folder_id)
+                        if gdrive_id:
+                            gdrive_url = gdrive_file_url(gdrive_id)
+                            self.gdrive_count += 1
+                            if self.config.delete_local_after_upload:
+                                primary_path.unlink(missing_ok=True)
+                                meta_path.unlink(missing_ok=True)
+                                for empty_dir in (book_dir, book_dir.parent):
+                                    try:
+                                        empty_dir.rmdir()
+                                    except OSError:
+                                        pass
+                                cleared_local = True
+                                epub_path_str = None
+                                pdf_path_str = None
+                except Exception as exc:
+                    errors.append(f"gdrive_upload_failed: {exc}")
 
-        got_count = int(bool(epub_path_str)) + int(bool(pdf_path_str))
-        if got_count == 0:
+            if not cleared_local:
+                meta_payload = {
+                    "url": book.url,
+                    "source": self.name,
+                    "title": book.title,
+                    "author": book.author,
+                    "category": book.category,
+                    "description": book.description,
+                    "epub_url": book.epub_url,
+                    "pdf_url": book.pdf_url,
+                    "epub_path": epub_path_str,
+                    "pdf_path": pdf_path_str,
+                    "gdrive_id": gdrive_id,
+                    "gdrive_url": gdrive_url,
+                }
+                meta_path.write_text(
+                    json.dumps(meta_payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
+        if not file_fmt:
             if not book.epub_url and not book.pdf_url and not book.chapters:
                 final_status = "no_files"
                 self.no_files_count += 1
@@ -661,5 +696,9 @@ class BaseEbookSpider:
             pdf_url=book.pdf_url,
             epub_path=epub_path_str,
             pdf_path=pdf_path_str,
+            file_format=file_fmt,
+            gdrive_id=gdrive_id,
+            gdrive_url=gdrive_url,
+            clear_local_paths=cleared_local,
             error="; ".join(errors) if errors else None,
         )

@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import sys
+import tempfile
 from pathlib import Path
 from typing import List, Set
 
@@ -56,8 +57,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path(r"D:\Books"),
-        help=r"Thư mục lưu sách đã tải (mặc định: D:\Books)",
+        default=Path(tempfile.gettempdir()) / "vn-ebook-staging",
+        help="Thư mục đệm tạm thời trước khi đẩy lên Google Drive (mặc định: thư mục TEMP hệ thống)",
     )
     parser.add_argument(
         "--db",
@@ -95,6 +96,31 @@ def parse_args() -> argparse.Namespace:
         "--reset-discovery",
         action="store_true",
         help="Xóa dấu trang danh mục đã quét để duyệt lại từ đầu (vẫn giữ và bỏ qua các sách đã tải)",
+    )
+    parser.add_argument(
+        "--no-gdrive",
+        action="store_true",
+        help="Tắt tự động lưu lên Google Drive, chỉ lưu ở thư mục cục bộ",
+    )
+    parser.add_argument(
+        "--gdrive-folder",
+        default="Books",
+        help="Tên thư mục gốc trên Google Drive để lưu sách (mặc định: Books)",
+    )
+    parser.add_argument(
+        "--gdrive-folder-id",
+        default=None,
+        help="ID thư mục gốc trên Google Drive nếu muốn chỉ định trực tiếp",
+    )
+    parser.add_argument(
+        "--keep-local",
+        action="store_true",
+        help="Giữ lại bản sao cục bộ trên máy sau khi đã upload lên Google Drive (mặc định sẽ xóa file tạm)",
+    )
+    parser.add_argument(
+        "--sync-gdrive",
+        action="store_true",
+        help="Đồng bộ toàn bộ sách đã tải sẵn trong thư mục cục bộ lên Google Drive rồi thoát",
     )
     return parser.parse_args()
 
@@ -135,6 +161,7 @@ async def print_stats(db_path: Path) -> None:
     table.add_column("Một phần", justify="right", style="yellow")
     table.add_column("EPUB", justify="right", style="green")
     table.add_column("PDF", justify="right", style="blue")
+    table.add_column("Trên GDrive", justify="right", style="bright_green")
     table.add_column("Chờ xử lý", justify="right")
     table.add_column("Không file/Lỗi", justify="right", style="red")
 
@@ -150,6 +177,7 @@ async def print_stats(db_path: Path) -> None:
             str(row["partial"]),
             str(row["epubs"]),
             str(row["pdfs"]),
+            str(row["gdrive_count"]),
             str(row["pending"]),
             str(row["no_files"] + row["failed"]),
         )
@@ -184,8 +212,17 @@ def main() -> int:
         use_katana=not args.no_katana,
         katana_depth=args.katana_depth,
         katana_headless=args.katana_headless,
+        use_gdrive=not args.no_gdrive,
+        gdrive_root_folder=args.gdrive_folder,
+        gdrive_root_id=args.gdrive_folder_id,
+        delete_local_after_upload=not args.keep_local and not args.no_gdrive,
     )
     engine = ParallelCrawlEngine(cfg, sources)
+    if args.sync_gdrive:
+        asyncio.run(engine.sync_existing_books_to_gdrive())
+        asyncio.run(print_stats(args.db))
+        return 0
+
     interrupted = False
     try:
         asyncio.run(

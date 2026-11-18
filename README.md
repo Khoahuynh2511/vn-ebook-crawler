@@ -26,42 +26,42 @@ Khi chạy `--sources all` (mặc định), crawler tập trung vào **4 nguồn
 Mở terminal tại `D:\vn-ebook-crawler`:
 
 ```bash
-# 1. Thử nghiệm nhanh: quét và tải tối đa 2 sách/nguồn trên tất cả các nguồn song song vào D:\Books
-python main.py --sources all --limit 2 --workers 3 --output-dir D:\Books
+# 1. Thử nghiệm nhanh: quét và tải tối đa 2 sách/nguồn trên 4 nguồn hiệu quả thẳng lên Google Drive ("Books")
+python main.py --sources all --limit 2 --workers 3
 
-# 2. Quét và tải TẤT CẢ sách từ tất cả các nguồn mở (không giới hạn) vào D:\Books
+# 2. Quét và tải TẤT CẢ sách lên Google Drive (dùng thư mục đệm %TEMP% và tự xóa file tạm sau khi upload)
 python main.py --sources all --workers 5
 
-# 3. Chỉ chạy các nguồn cụ thể và chỉ tải EPUB
-python main.py --sources sach_gallery,metaisach,sachhayonline --formats epub
+# 3. Chỉ chạy các nguồn cụ thể và giữ thêm bản sao cục bộ trên máy (--keep-local)
+python main.py --sources metaisach,thuviensach,sachhayonline --limit 10 --keep-local --output-dir D:\Books
 
-# 4. Xem thống kê sách đã thu thập trong catalog.db
+# 4. Xem thống kê sách đã thu thập trong catalog.db (bao gồm số lượng đã lên Google Drive)
 python main.py --stats
 
 # 5. Dừng & Tiếp tục sau (Stop / Resume)
 # - Có thể bấm Ctrl+C bất kỳ lúc nào; các sách đang tải dở sẽ được trả về trạng thái chờ (discovered),
-#   và toàn bộ tiến trình được lưu tự động vào D:\vn-ebook-crawler\catalog.db + D:\Books\crawl_progress.json.
-# - Chạy lại cùng lệnh (hoặc tăng --limit / bỏ --limit): chương trình tự động bỏ qua sách đã tải (cột Đã có (Skip))
-#   và tự tải lại nếu file đó trên ổ đĩa D:\Books bị xóa thủ công.
+#   và toàn bộ tiến trình được lưu tự động vào catalog.db + crawl_progress.json (trên Google Drive Books/).
+# - Chạy lại cùng lệnh: chương trình tự động bỏ qua sách đã lưu trên Google Drive (cột Đã có (Skip)).
 python main.py --sources all --workers 5
 
-# 6. Thử tải lại các sách từng lỗi mạng hoặc quét lại danh mục từ đầu (vẫn bỏ qua sách đã tải xong)
-python main.py --sources all --retry-failed
-python main.py --sources all --reset-discovery
+# 6. Đồng bộ lên Google Drive / Chế độ cục bộ
+# Đẩy toàn bộ sách cục bộ chưa upload lên Google Drive rồi xóa file tạm:
+python main.py --sync-gdrive
+
+# Tắt Google Drive, chỉ lưu vào thư mục cục bộ được chỉ định:
+python main.py --sources all --limit 10 --no-gdrive --output-dir D:\Books
 ```
 
 ## Cơ chế Lưu tiến trình (Stop/Resume Checkpoint)
-- **`D:\vn-ebook-crawler\catalog.db`**: Lưu từng đầu sách (`discovered`, `processing`, `completed`, `partial`, `no_files`, `failed`, `blocked_by_captcha`) cùng các trang danh mục đã duyệt (`visited_pages`).
-- **`D:\Books\crawl_progress.json`**: File JSON tóm tắt tiến trình dễ đọc (thống kê theo từng nguồn + danh sách sách đã tải và đường dẫn file).
-- Nếu bạn nhấn `Ctrl+C` để dừng giữa chừng, hệ thống tự động đặt lại các cuốn `processing` về `discovered` và cập nhật checkpoint trước khi thoát.
+- **`D:\vn-ebook-crawler\catalog.db`**: Lưu từng đầu sách (`discovered`, `processing`, `completed`, `no_files`, `failed`, `blocked_by_captcha`), định dạng (`file_format`), `gdrive_id`/`gdrive_url` cùng các trang danh mục đã duyệt (`visited_pages`).
+- **`crawl_progress.json`**: File JSON tóm tắt tiến trình dễ đọc được tự động đồng bộ lên thư mục gốc `Books/` trên Google Drive.
+- Nếu bạn nhấn `Ctrl+C` để dừng giữa chừng, hệ thống tự động đặt lại các cuốn `processing` về `discovered` và đồng bộ checkpoint lên Google Drive trước khi thoát.
 
-## Cấu trúc thư mục xuất ra
+## Cấu trúc thư mục trên Google Drive (`Books/`)
 ```text
-D:\Books\
+Books/
 ├── crawl_progress.json
-└── <nguon>\
-    └── <the-loai>\
-        ├── <ten-sach>.epub
-        ├── <ten-sach>.pdf
-        └── <ten-sach>.meta.json
+└── <nguon>/
+    └── <the-loai>/
+        └── <ten-sach>.epub (hoặc .pdf nếu không có EPUB)
 ```
