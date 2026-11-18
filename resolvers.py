@@ -2,7 +2,7 @@ import asyncio
 import random
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 from urllib.parse import urljoin
 
 import aiofiles
@@ -139,13 +139,28 @@ class FileDownloader:
         retries: int = 3,
     ) -> bool:
         """Download file to .part temp file with Retry-After/backoff, validate magic bytes, and rename."""
+        ok, _ = await self.download_book_with_status(
+            client, url, dest_path, expected_ext, referer=referer, retries=retries
+        )
+        return ok
+
+    async def download_book_with_status(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        dest_path: Path,
+        expected_ext: str,
+        referer: Optional[str] = None,
+        retries: int = 3,
+    ) -> Tuple[bool, bool]:
+        """Download book file and return (success, is_daily_or_hard_rate_limited)."""
         dest_path = Path(dest_path)
         if dest_path.exists() and validate_file_header(dest_path, expected_ext):
-            return True
+            return True, False
 
         resolved_url = await self.resolve_download_url(client, url)
         if not resolved_url:
-            return False
+            return False, False
 
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         part_path = dest_path.with_suffix(f".{expected_ext.lstrip('.')}.part")
@@ -159,14 +174,26 @@ class FileDownloader:
                 async with client.stream(
                     "GET", resolved_url, headers=req_headers, timeout=90.0
                 ) as resp:
-                    if resp.status_code in (429, 500, 502, 503, 504):
+                    if resp.status_code == 429:
+                        ctype = resp.headers.get("content-type", "").lower()
+                        has_retry_after = bool(resp.headers.get("Retry-After"))
+                        # Daily quota HTML page (e.g. sach.gallery 20/day) or missing Retry-After -> stop quickly
+                        if "text/html" in ctype and not has_retry_after:
+                            return False, True
                         if attempt < retries:
                             wait = _parse_retry_after(resp, 1.5 * (2**attempt))
                             await asyncio.sleep(wait)
                             continue
-                        return False
+                        return False, True
+
+                    if resp.status_code in (500, 502, 503, 504):
+                        if attempt < retries:
+                            wait = _parse_retry_after(resp, 1.5 * (2**attempt))
+                            await asyncio.sleep(wait)
+                            continue
+                        return False, False
                     if resp.status_code >= 400:
-                        return False
+                        return False, False
 
                     async with aiofiles.open(part_path, "wb") as out_f:
                         async for chunk in resp.aiter_bytes(chunk_size=65536):
@@ -174,19 +201,19 @@ class FileDownloader:
                                 await out_f.write(chunk)
 
                 if not validate_file_header(part_path, expected_ext):
-                    return False
+                    return False, False
 
                 if dest_path.exists():
                     dest_path.unlink()
                 part_path.rename(dest_path)
-                return True
+                return True, False
             except (httpx.HTTPError, OSError):
                 part_path.unlink(missing_ok=True)
                 if attempt < retries:
                     await asyncio.sleep(1.5 * (2**attempt) + random.uniform(0.2, 0.8))
                     continue
-                return False
+                return False, False
             except Exception:
                 part_path.unlink(missing_ok=True)
-                return False
-        return False
+                return False, False
+        return False, False

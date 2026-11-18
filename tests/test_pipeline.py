@@ -558,3 +558,135 @@ async def test_gdrive_uploader_and_book_sync(tmp_path: Path, monkeypatch) -> Non
         assert stats["metaisach"]["gdrive_count"] == 0
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_cursor_and_rate_limit_pause(tmp_path: Path) -> None:
+    import httpx
+    from spiders.base import FetchResult
+
+    cfg = CrawlerConfig(
+        output_dir=tmp_path / "staging",
+        db_path=tmp_path / "catalog.db",
+        max_books_per_source=1,
+        request_delay=0.0,
+        use_gdrive=False,
+    )
+    db = CatalogDB(cfg.db_path)
+    try:
+        # 1. Verify FIFO order is preserved even if an earlier book had mark_processing called
+        for i in range(1, 4):
+            await db.upsert_discovered_book(f"https://www.sach.gallery/sach/fifo-{i}", "sach_gallery")
+        await db.mark_processing("https://www.sach.gallery/sach/fifo-1")
+        await db.reset_interrupted_books()
+        fifo = await db.get_pending_books("sach_gallery")
+        assert [r["url"] for r in fifo[:3]] == [
+            "https://www.sach.gallery/sach/fifo-1",
+            "https://www.sach.gallery/sach/fifo-2",
+            "https://www.sach.gallery/sach/fifo-3",
+        ]
+
+        # 2. Simulate sitemap resume cursor stopping mid-sitemap and continuing from exact offset
+        locs = "\n".join(
+            f"<url><loc>https://www.sach.gallery/sach/sm-{i:02d}</loc></url>"
+            for i in range(1, 26)
+        )
+        sm_xml = f"<urlset>{locs}</urlset>"
+
+        sp1 = SachGallerySpider(cfg, db)
+        sp1.sitemap_paths = ["/sitemap.xml"]
+        sp1.fetch_html = AsyncMock(
+            return_value=FetchResult(
+                url="https://www.sach.gallery/sitemap.xml",
+                status_code=200,
+                text=sm_xml,
+            )
+        )
+        q1: asyncio.Queue = asyncio.Queue()
+        queued1 = set()
+        # With 3 FIFO items already counted, discovered_count starts at 3, cap is 16 -> processes 13 items
+        sp1.discovered_count = 3
+        await sp1._scan_sitemap(
+            None, "https://www.sach.gallery", q1, queued1, [], set()
+        )
+        entry_after_1 = await db.get_discovery_entry("https://www.sach.gallery/sitemap.xml")
+        assert entry_after_1 is not None
+        assert entry_after_1["status"] == "pending"
+        assert entry_after_1["last_offset"] == 13
+        assert q1.qsize() == 13
+
+        # Second spider resumes directly at offset 13 and reaches end (25)
+        cfg2 = CrawlerConfig(
+            output_dir=tmp_path / "staging",
+            db_path=cfg.db_path,
+            max_books_per_source=10,
+            request_delay=0.0,
+            use_gdrive=False,
+        )
+        sp2 = SachGallerySpider(cfg2, db)
+        sp2.sitemap_paths = ["/sitemap.xml"]
+        sp2.fetch_html = AsyncMock(
+            return_value=FetchResult(
+                url="https://www.sach.gallery/sitemap.xml",
+                status_code=200,
+                text=sm_xml,
+            )
+        )
+        q2: asyncio.Queue = asyncio.Queue()
+        await sp2._scan_sitemap(
+            None, "https://www.sach.gallery", q2, set(), [], set()
+        )
+        entry_after_2 = await db.get_discovery_entry("https://www.sach.gallery/sitemap.xml")
+        assert entry_after_2["status"] == "done"
+        assert entry_after_2["last_offset"] == 25
+        # Only remaining 12 items (14..25) were queued, NOT re-scanning 1..13!
+        assert q2.qsize() == 12
+        assert sp2.skipped_count == 0
+
+        # 3. Verify HTTP 429 daily quota keeps book pending (not failed) and sets rate_limited_stop
+        rl_url = "https://www.sach.gallery/sach/fifo-1"
+        sp2.parse_book = AsyncMock(
+            return_value=BookData(
+                url=rl_url,
+                title="Sách Chạm Hạn Mức",
+                category="van-hoc",
+                epub_url="https://www.sach.gallery/tai/99",
+            )
+        )
+
+        class _RateLimitDownloader(FileDownloader):
+            async def resolve_download_url(self, client, url: str):
+                return url
+
+        class _Mock429Stream:
+            def __init__(self, url: str) -> None:
+                self.status_code = 429
+                self.headers = {"content-type": "text/html; charset=utf-8"}
+                self.url = url
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _Mock429Client:
+            def stream(self, method: str, url: str, **kwargs):
+                return _Mock429Stream(url)
+
+        await sp2.process_book(
+            _Mock429Client(), _RateLimitDownloader(), asyncio.Semaphore(1), rl_url, "van-hoc"
+        )
+        assert sp2.rate_limited_stop is True
+        assert sp2.failed_count == 0
+        row_rl = db._conn.execute(
+            "SELECT status, error FROM books WHERE url = ?", (rl_url,)
+        ).fetchone()
+        assert row_rl["status"] == "discovered"
+        assert row_rl["error"] == "rate_limited_daily"
+
+        ckpt = await db.export_progress_checkpoint(tmp_path / "crawl_progress.json")
+        assert "sach_gallery" in ckpt["resume_cursors"]
+        assert ckpt["resume_cursors"]["sach_gallery"]["next_pending_urls"][0] == rl_url
+    finally:
+        db.close()

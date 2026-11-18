@@ -80,6 +80,36 @@ class CatalogDB:
                 )
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS discovery_queue (
+                    url TEXT PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    category TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    last_offset INTEGER NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMP NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_discovery_queue_source ON discovery_queue(source, kind, status);"
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS source_checkpoints (
+                    source TEXT PRIMARY KEY,
+                    last_phase TEXT,
+                    last_cursor_url TEXT,
+                    last_cursor_offset INTEGER NOT NULL DEFAULT 0,
+                    last_book_url TEXT,
+                    last_book_title TEXT,
+                    status_note TEXT,
+                    updated_at TIMESTAMP NOT NULL
+                )
+                """
+            )
 
     def _reset_interrupted_sync(self) -> int:
         with self._conn:
@@ -116,15 +146,38 @@ class CatalogDB:
                 return int(cur.rowcount or 0)
 
     async def clear_visited_pages(self, source: Optional[str] = None) -> None:
-        """Clear visited listing/category pages to force full discovery re-scan."""
+        """Clear visited pages, discovery cursors, and checkpoints to force discovery re-scan."""
         async with self._lock:
             with self._conn:
                 if source:
                     self._conn.execute(
                         "DELETE FROM visited_pages WHERE source = ?", (source,)
                     )
+                    self._conn.execute(
+                        "DELETE FROM discovery_queue WHERE source = ?", (source,)
+                    )
+                    self._conn.execute(
+                        "UPDATE source_checkpoints SET last_phase = NULL, last_cursor_url = NULL, last_cursor_offset = 0 "
+                        "WHERE source = ?",
+                        (source,),
+                    )
                 else:
                     self._conn.execute("DELETE FROM visited_pages")
+                    self._conn.execute("DELETE FROM discovery_queue")
+                    self._conn.execute(
+                        "UPDATE source_checkpoints SET last_phase = NULL, last_cursor_url = NULL, last_cursor_offset = 0"
+                    )
+
+    async def reset_rate_limited_to_pending(self, url: str) -> None:
+        """Keep a rate-limited book as 'discovered' (preserves FIFO rowid) so next run retries it."""
+        now = _utc_now()
+        async with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE books SET status = 'discovered', error = 'rate_limited_daily', updated_at = ? "
+                    "WHERE url = ?",
+                    (now, url),
+                )
 
     async def get_gdrive_folder_id(self, cache_key: str) -> Optional[str]:
         async with self._lock:
@@ -224,13 +277,13 @@ class CatalogDB:
     async def get_pending_books(
         self, source: str, limit: int = 0
     ) -> List[Dict[str, Any]]:
-        """Return books whose status is discovered or processing or failed (for resume)."""
+        """Return books whose status is discovered or processing in exact FIFO discovery order."""
         async with self._lock:
             sql = """
                 SELECT url, source, title, author, category, status
                 FROM books
                 WHERE source = ? AND status IN ('discovered', 'processing')
-                ORDER BY updated_at ASC
+                ORDER BY rowid ASC
             """
             params: List[Any] = [source]
             if limit and limit > 0:
@@ -238,6 +291,189 @@ class CatalogDB:
                 params.append(limit)
             rows = self._conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]
+
+    async def enqueue_discovery_target(
+        self,
+        url: str,
+        source: str,
+        kind: str,
+        category: Optional[str] = None,
+    ) -> None:
+        now = _utc_now()
+        async with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO discovery_queue (url, source, kind, category, status, last_offset, updated_at)
+                    VALUES (?, ?, ?, ?, 'pending', 0, ?)
+                    """,
+                    (url, source, kind, category, now),
+                )
+
+    async def get_discovery_targets(
+        self, source: str, kind: str
+    ) -> List[Dict[str, Any]]:
+        async with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT url, source, kind, category, status, last_offset
+                FROM discovery_queue
+                WHERE source = ? AND kind = ? AND status = 'pending'
+                ORDER BY rowid ASC
+                """,
+                (source, kind),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    async def get_discovery_entry(self, url: str) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            row = self._conn.execute(
+                "SELECT url, source, kind, category, status, last_offset FROM discovery_queue WHERE url = ?",
+                (url,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    async def update_discovery_progress(
+        self,
+        url: str,
+        source: str,
+        kind: str,
+        *,
+        last_offset: int = 0,
+        status: str = "pending",
+        category: Optional[str] = None,
+    ) -> None:
+        now = _utc_now()
+        async with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO discovery_queue (url, source, kind, category, status, last_offset, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(url) DO UPDATE SET
+                        status = excluded.status,
+                        last_offset = excluded.last_offset,
+                        category = COALESCE(excluded.category, discovery_queue.category),
+                        updated_at = excluded.updated_at
+                    """,
+                    (url, source, kind, category, status, last_offset, now),
+                )
+
+    async def has_discovery_history(self, source: str) -> bool:
+        async with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM discovery_queue WHERE source = ? LIMIT 1",
+                (source,),
+            ).fetchone()
+            return row is not None
+
+    async def update_source_checkpoint(
+        self,
+        source: str,
+        *,
+        last_phase: Optional[str] = None,
+        last_cursor_url: Optional[str] = None,
+        last_cursor_offset: Optional[int] = None,
+        last_book_url: Optional[str] = None,
+        last_book_title: Optional[str] = None,
+        status_note: Optional[str] = None,
+    ) -> None:
+        now = _utc_now()
+        async with self._lock:
+            existing = self._conn.execute(
+                "SELECT * FROM source_checkpoints WHERE source = ?",
+                (source,),
+            ).fetchone()
+            with self._conn:
+                if existing is None:
+                    self._conn.execute(
+                        """
+                        INSERT INTO source_checkpoints (
+                            source, last_phase, last_cursor_url, last_cursor_offset,
+                            last_book_url, last_book_title, status_note, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            source,
+                            last_phase,
+                            last_cursor_url,
+                            last_cursor_offset if last_cursor_offset is not None else 0,
+                            last_book_url,
+                            last_book_title,
+                            status_note,
+                            now,
+                        ),
+                    )
+                else:
+                    self._conn.execute(
+                        """
+                        UPDATE source_checkpoints
+                        SET
+                            last_phase = COALESCE(?, last_phase),
+                            last_cursor_url = COALESCE(?, last_cursor_url),
+                            last_cursor_offset = COALESCE(?, last_cursor_offset),
+                            last_book_url = COALESCE(?, last_book_url),
+                            last_book_title = COALESCE(?, last_book_title),
+                            status_note = COALESCE(?, status_note),
+                            updated_at = ?
+                        WHERE source = ?
+                        """,
+                        (
+                            last_phase,
+                            last_cursor_url,
+                            last_cursor_offset,
+                            last_book_url,
+                            last_book_title,
+                            status_note,
+                            now,
+                            source,
+                        ),
+                    )
+
+    async def get_source_checkpoints(self) -> Dict[str, Dict[str, Any]]:
+        async with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM source_checkpoints ORDER BY source"
+            ).fetchall()
+            result: Dict[str, Dict[str, Any]] = {dict(r)["source"]: dict(r) for r in rows}
+
+            # Ensure every source present in books table also exposes its resume queue/last book
+            sources_in_db = [
+                r["source"]
+                for r in self._conn.execute("SELECT DISTINCT source FROM books ORDER BY source").fetchall()
+            ]
+            for src in sources_in_db:
+                if src not in result:
+                    last_done = self._conn.execute(
+                        "SELECT url, title, updated_at FROM books WHERE source = ? AND status IN ('completed', 'partial') "
+                        "ORDER BY updated_at DESC LIMIT 1",
+                        (src,),
+                    ).fetchone()
+                    result[src] = {
+                        "source": src,
+                        "last_phase": None,
+                        "last_cursor_url": None,
+                        "last_cursor_offset": 0,
+                        "last_book_url": last_done["url"] if last_done else None,
+                        "last_book_title": last_done["title"] if last_done else None,
+                        "status_note": "Sẵn sàng tiếp tục",
+                        "updated_at": last_done["updated_at"] if last_done else None,
+                    }
+
+                item = result[src]
+                next_rows = self._conn.execute(
+                    "SELECT url FROM books WHERE source = ? AND status IN ('discovered', 'processing') "
+                    "ORDER BY rowid ASC LIMIT 3",
+                    (src,),
+                ).fetchall()
+                item["next_pending_urls"] = [nr["url"] for nr in next_rows]
+                pending_disc = self._conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM discovery_queue WHERE source = ? AND status = 'pending'",
+                    (src,),
+                ).fetchone()
+                item["pending_discovery_pages"] = int(pending_disc["cnt"]) if pending_disc else 0
+            return result
 
     async def count_books_by_source(self, source: str) -> int:
         async with self._lock:
@@ -383,6 +619,7 @@ class CatalogDB:
     async def export_progress_checkpoint(self, checkpoint_path: Path) -> Dict[str, Any]:
         """Export human-readable JSON progress checkpoint alongside SQLite DB."""
         stats = await self.get_summary_stats()
+        checkpoints = await self.get_source_checkpoints()
         async with self._lock:
             done_rows = self._conn.execute(
                 """
@@ -401,6 +638,7 @@ class CatalogDB:
             "db_path": str(self.db_path),
             "pending_total": int(pending_row["cnt"]) if pending_row else 0,
             "summary_by_source": stats,
+            "resume_cursors": checkpoints,
             "completed_books": [dict(r) for r in done_rows],
         }
         checkpoint_path = Path(checkpoint_path)

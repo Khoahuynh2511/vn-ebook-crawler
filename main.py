@@ -151,6 +151,7 @@ async def print_stats(db_path: Path) -> None:
     db = CatalogDB(db_path)
     try:
         stats = await db.get_summary_stats()
+        checkpoints = await db.get_source_checkpoints()
     finally:
         db.close()
 
@@ -182,6 +183,30 @@ async def print_stats(db_path: Path) -> None:
             str(row["no_files"] + row["failed"]),
         )
     console.print(table)
+
+    if checkpoints:
+        cp_table = Table(title="Điểm dừng & Vị trí tiếp tục (Resume Cursors)")
+        cp_table.add_column("Nguồn", style="cyan", no_wrap=True)
+        cp_table.add_column("Vị trí quét (Cursor)", overflow="fold")
+        cp_table.add_column("Cuốn vừa tải", overflow="fold", style="green")
+        cp_table.add_column("Cuốn tiếp theo sẽ tải", overflow="fold", style="blue")
+        cp_table.add_column("Ghi chú", style="yellow")
+
+        for source, cp in checkpoints.items():
+            cursor_txt = cp.get("last_cursor_url") or "-"
+            offset = cp.get("last_cursor_offset") or 0
+            if cursor_txt != "-" and offset:
+                cursor_txt = f"{cursor_txt} (#{offset})"
+            next_urls = cp.get("next_pending_urls") or []
+            next_txt = next_urls[0] if next_urls else "(Sẽ quét tiếp trang/sitemap kế tiếp)"
+            cp_table.add_row(
+                source,
+                cursor_txt,
+                cp.get("last_book_title") or cp.get("last_book_url") or "-",
+                next_txt,
+                cp.get("status_note") or "-",
+            )
+        console.print(cp_table)
 
 
 def main() -> int:

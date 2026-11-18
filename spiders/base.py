@@ -110,6 +110,7 @@ class BaseEbookSpider:
         self.gdrive_count: int = 0
         self.failed_count: int = 0
         self.adaptive_delay: float = 0.0
+        self.rate_limited_stop: bool = False
 
     def _effective_delay(self) -> float:
         base = max(self.config.request_delay, self.crawl_delay)
@@ -118,6 +119,8 @@ class BaseEbookSpider:
         return base + self.adaptive_delay + random.uniform(0.05, 0.2)
 
     def _reached_discovery_cap(self) -> bool:
+        if self.rate_limited_stop:
+            return True
         if self.config.max_books_per_source <= 0:
             return False
         if (self.epub_count + self.pdf_count) >= self.config.max_books_per_source:
@@ -313,7 +316,12 @@ class BaseEbookSpider:
         category_urls: List[str],
         seen_cats: Set[str],
     ) -> None:
-        sitemap_queue: List[str] = [urljoin(base_url, p) for p in self.sitemap_paths]
+        saved_targets = await self.db.get_discovery_targets(self.name, "sitemap")
+        sitemap_queue: List[str] = [row["url"] for row in saved_targets]
+        for p in self.sitemap_paths:
+            candidate = urljoin(base_url, p)
+            if candidate not in sitemap_queue:
+                sitemap_queue.append(candidate)
         visited_sitemaps: Set[str] = set()
 
         while sitemap_queue:
@@ -325,27 +333,61 @@ class BaseEbookSpider:
                 continue
             visited_sitemaps.add(sm_url)
 
+            entry = await self.db.get_discovery_entry(sm_url)
+            if entry and entry["status"] == "done":
+                continue
+
+            await self.db.enqueue_discovery_target(sm_url, self.name, "sitemap")
             res = await self.fetch_html(client, sm_url, retries=1)
             if res.status_code != 200 or not res.text:
                 continue
 
             locs = re.findall(r"<loc>\s*(https?://[^<\s]+)\s*</loc>", res.text)
             if not locs:
+                await self.db.update_discovery_progress(
+                    sm_url, self.name, "sitemap", last_offset=0, status="done"
+                )
                 continue
 
             if "<sitemapindex" in res.text or sm_url.endswith("sitemap_index.xml"):
                 for sub_loc in locs:
                     if sub_loc not in visited_sitemaps and self.is_relevant_sitemap(sub_loc):
+                        await self.db.enqueue_discovery_target(
+                            sub_loc, self.name, "sitemap"
+                        )
                         sitemap_queue.append(sub_loc)
+                await self.db.update_discovery_progress(
+                    sm_url, self.name, "sitemap", last_offset=len(locs), status="done"
+                )
             else:
-                for loc in locs:
+                start_idx = int(entry["last_offset"]) if entry and entry["last_offset"] > 0 else 0
+                for idx in range(start_idx, len(locs)):
+                    loc = locs[idx]
                     if self.is_book_url(loc):
                         await self._enqueue_book(loc, queue, queued_set=queued_set)
                         if self._reached_discovery_cap():
+                            await self.db.update_discovery_progress(
+                                sm_url, self.name, "sitemap", last_offset=idx + 1, status="pending"
+                            )
+                            await self.db.update_source_checkpoint(
+                                self.name,
+                                last_phase="sitemap",
+                                last_cursor_url=sm_url,
+                                last_cursor_offset=idx + 1,
+                            )
                             return
                     elif self.is_category_url(loc) and loc not in seen_cats:
                         seen_cats.add(loc)
                         category_urls.append(loc)
+                await self.db.update_discovery_progress(
+                    sm_url, self.name, "sitemap", last_offset=len(locs), status="done"
+                )
+                await self.db.update_source_checkpoint(
+                    self.name,
+                    last_phase="sitemap",
+                    last_cursor_url=sm_url,
+                    last_cursor_offset=len(locs),
+                )
 
     async def _crawl_listing_pages(
         self,
@@ -358,7 +400,7 @@ class BaseEbookSpider:
         seen_cats: Set[str],
         max_pages: int,
     ) -> None:
-        """Visit category/listing pages BFS-style, enqueueing discovered book URLs."""
+        """Visit category/listing pages BFS-style with persistent cursor tracking."""
         pages_scanned = 0
         while pages_to_visit and pages_scanned < max_pages:
             if self._reached_discovery_cap():
@@ -367,10 +409,12 @@ class BaseEbookSpider:
             if page_url in visited_listing:
                 continue
             visited_listing.add(page_url)
+
+            entry = await self.db.get_discovery_entry(page_url)
             if (
                 page_url != base_url
                 and self.config.max_books_per_source == 0
-                and await self.db.is_page_visited(page_url)
+                and ((entry and entry["status"] == "done") or await self.db.is_page_visited(page_url))
             ):
                 continue
 
@@ -385,25 +429,62 @@ class BaseEbookSpider:
             await self.db.mark_page_visited(page_url, self.name)
             soup = BeautifulSoup(res.text, "lxml")
 
-            for book_url in self.extract_book_links(soup, res.url):
+            for cat_url in self.extract_category_links(soup, res.url):
+                if cat_url not in seen_cats:
+                    seen_cats.add(cat_url)
+                    sub_cat = self._category_from_url(cat_url)
+                    await self.db.enqueue_discovery_target(
+                        cat_url, self.name, "listing", category=sub_cat
+                    )
+                    pages_to_visit.append((cat_url, sub_cat))
+            for next_url in self.extract_pagination_links(soup, res.url):
+                if next_url not in visited_listing:
+                    await self.db.enqueue_discovery_target(
+                        next_url, self.name, "listing", category=cat_name
+                    )
+                    pages_to_visit.append((next_url, cat_name))
+
+            book_links = self.extract_book_links(soup, res.url)
+            for idx, book_url in enumerate(book_links):
                 await self._enqueue_book(
                     book_url, queue, category=cat_name, queued_set=queued_set
                 )
                 if self._reached_discovery_cap():
+                    await self.db.update_discovery_progress(
+                        page_url,
+                        self.name,
+                        "listing",
+                        last_offset=idx + 1,
+                        status="pending",
+                        category=cat_name,
+                    )
+                    await self.db.update_source_checkpoint(
+                        self.name,
+                        last_phase="listing",
+                        last_cursor_url=page_url,
+                        last_cursor_offset=idx + 1,
+                    )
                     return
 
-            for cat_url in self.extract_category_links(soup, res.url):
-                if cat_url not in seen_cats:
-                    seen_cats.add(cat_url)
-                    pages_to_visit.append((cat_url, self._category_from_url(cat_url)))
-            for next_url in self.extract_pagination_links(soup, res.url):
-                if next_url not in visited_listing:
-                    pages_to_visit.append((next_url, cat_name))
+            await self.db.update_discovery_progress(
+                page_url,
+                self.name,
+                "listing",
+                last_offset=len(book_links),
+                status="done",
+                category=cat_name,
+            )
+            await self.db.update_source_checkpoint(
+                self.name,
+                last_phase="listing",
+                last_cursor_url=page_url,
+                last_cursor_offset=len(book_links),
+            )
 
     async def discover_books(
         self, client: httpx.AsyncClient, queue: asyncio.Queue
     ) -> None:
-        """Actively discover books via seed categories, Katana, sitemaps, and pagination."""
+        """Actively discover books via saved resume cursors, seed categories, Katana, sitemaps, and pagination."""
         self.status_message = "Đang tìm nguồn..."
         base_url = await self.resolve_active_mirror(client)
         if not base_url:
@@ -415,7 +496,7 @@ class BaseEbookSpider:
             else 0
         )
 
-        # Re-enqueue pending books from previous interrupted runs
+        # Re-enqueue pending books from previous interrupted runs in exact FIFO order
         queued_set: Set[str] = set()
         pending = await self.db.get_pending_books(self.name, limit=pending_cap)
         for row in pending:
@@ -425,9 +506,17 @@ class BaseEbookSpider:
                 self.discovered_count += 1
                 await queue.put((url, row.get("category") or "tong-hop"))
 
+        if pending:
+            await self.db.update_source_checkpoint(
+                self.name,
+                last_phase="resume_pending",
+                status_note=f"Đang tải tiếp {len(pending)} sách chờ",
+            )
+
         category_urls: List[str] = []
         seen_cats: Set[str] = set()
         visited_listing: Set[str] = set()
+        has_cursor = await self.db.has_discovery_history(self.name)
 
         # Priority seed categories (before Katana bursts homepage links)
         if self.seed_category_paths and not self._reached_discovery_cap():
@@ -449,10 +538,11 @@ class BaseEbookSpider:
                 max_pages=min(10, self.config.max_discovery_pages),
             )
 
-        # Phase 0: ProjectDiscovery Katana high-speed Go discovery (skip on strict crawl_delay sites)
+        # Phase 0: Katana discovery only on fresh discovery (avoid redundant re-crawl once cursors exist)
         katana = KatanaDiscovery(self.config.katana_bin)
         if (
             self.config.use_katana
+            and not has_cursor
             and self.crawl_delay < 2.0
             and katana.is_available
             and not self._reached_discovery_cap()
@@ -483,19 +573,22 @@ class BaseEbookSpider:
                 # Fall back seamlessly to Python Sitemap & Category discovery
                 pass
 
-        # Phase A: Sitemap scan (supplements Katana if target cap not yet reached)
+        # Phase A: Sitemap scan with exact per-sitemap offset resume
         if not self._reached_discovery_cap():
             self.status_message = "Đang quét Sitemap & Danh mục..."
             await self._scan_sitemap(
                 client, base_url, queue, queued_set, category_urls, seen_cats
             )
 
-        # Phase B: Homepage + Category & Pagination scan
+        # Phase B: Persistent listing / pagination queue + homepage scan
         if not self._reached_discovery_cap():
+            saved_listings = await self.db.get_discovery_targets(self.name, "listing")
             pages_to_visit: List[Tuple[str, str]] = [
-                (urljoin(base_url, p), self._category_from_url(p))
-                for p in self.seed_category_paths
+                (row["url"], row.get("category") or self._category_from_url(row["url"]))
+                for row in saved_listings
             ]
+            for p in self.seed_category_paths:
+                pages_to_visit.append((urljoin(base_url, p), self._category_from_url(p)))
             pages_to_visit.append((base_url, "tong-hop"))
             for cat in category_urls:
                 pages_to_visit.append((cat, self._category_from_url(cat)))
@@ -510,7 +603,7 @@ class BaseEbookSpider:
                 max_pages=self.config.max_discovery_pages,
             )
 
-        if not self.status_message.startswith("Bị chặn"):
+        if not self.status_message.startswith(("Bị chặn", "Đạt hạn mức")):
             self.status_message = "Đang tải sách..."
 
     def _category_from_url(self, url: str) -> str:
@@ -581,14 +674,45 @@ class BaseEbookSpider:
         pdf_path_str: Optional[str] = None
         errors: List[str] = []
 
+        async def _download_with_status(
+            dl_url: str, dest: Path, ext: str
+        ) -> Tuple[bool, bool]:
+            async with download_sem:
+                if hasattr(downloader, "download_book_with_status"):
+                    return await downloader.download_book_with_status(
+                        client, dl_url, dest, ext, referer=book.url
+                    )
+                ok = await downloader.download_book_file(
+                    client, dl_url, dest, ext, referer=book.url
+                )
+                return ok, False
+
+        async def _handle_rate_limit() -> None:
+            for empty_dir in (book_dir, book_dir.parent):
+                try:
+                    empty_dir.rmdir()
+                except OSError:
+                    pass
+            await self.db.reset_rate_limited_to_pending(url)
+            self.rate_limited_stop = True
+            self.status_message = "Đạt hạn mức ngày (đã lưu điểm dừng)"
+            await self.db.update_source_checkpoint(
+                self.name,
+                last_book_url=url,
+                last_book_title=book.title,
+                status_note="Đạt hạn mức tải ngày (HTTP 429), đã lưu điểm dừng để chạy tiếp lần sau",
+            )
+
         # Download EPUB if requested and available
         if "epub" in self.config.formats:
             dest_epub = book_dir / f"{book_slug}.epub"
             if book.epub_url:
-                async with download_sem:
-                    ok = await downloader.download_book_file(
-                        client, book.epub_url, dest_epub, "epub", referer=book.url
-                    )
+                ok, rate_limited = await _download_with_status(
+                    book.epub_url, dest_epub, "epub"
+                )
+                if rate_limited:
+                    await _handle_rate_limit()
+                    return
                 if ok:
                     epub_path_str = str(dest_epub)
                     self.epub_count += 1
@@ -612,10 +736,12 @@ class BaseEbookSpider:
         # Download PDF only if EPUB was not obtained (prefer EPUB when both exist)
         if "pdf" in self.config.formats and book.pdf_url and not epub_path_str:
             dest_pdf = book_dir / f"{book_slug}.pdf"
-            async with download_sem:
-                ok = await downloader.download_book_file(
-                    client, book.pdf_url, dest_pdf, "pdf", referer=book.url
-                )
+            ok, rate_limited = await _download_with_status(
+                book.pdf_url, dest_pdf, "pdf"
+            )
+            if rate_limited:
+                await _handle_rate_limit()
+                return
             if ok:
                 pdf_path_str = str(dest_pdf)
                 self.pdf_count += 1
@@ -702,3 +828,10 @@ class BaseEbookSpider:
             clear_local_paths=cleared_local,
             error="; ".join(errors) if errors else None,
         )
+        if final_status == "completed":
+            await self.db.update_source_checkpoint(
+                self.name,
+                last_book_url=book.url,
+                last_book_title=book.title,
+                status_note="Đang chạy",
+            )

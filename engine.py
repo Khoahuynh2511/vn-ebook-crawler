@@ -29,6 +29,7 @@ class ParallelCrawlEngine:
             self.db, root_folder_id=config.gdrive_root_id
         )
         self.download_sem = asyncio.Semaphore(config.download_concurrency)
+        self._ckpt_lock = asyncio.Lock()
         self.console = Console()
         self.spiders: List[BaseEbookSpider] = [
             SPIDER_REGISTRY[name](config, self.db)
@@ -89,7 +90,8 @@ class ParallelCrawlEngine:
                 try:
                     if item is None:
                         return
-                    if stop_event.is_set():
+                    if stop_event.is_set() or spider.rate_limited_stop:
+                        stop_event.set()
                         continue
 
                     book_url, category = item
@@ -109,6 +111,13 @@ class ParallelCrawlEngine:
                         gdrive=self.gdrive if self.config.use_gdrive else None,
                     )
 
+                    if spider.rate_limited_stop:
+                        stop_event.set()
+                    elif spider.processed_count > 0 and spider.processed_count % 10 == 0:
+                        async with self._ckpt_lock:
+                            ckpt_path = self.config.output_dir / "crawl_progress.json"
+                            await self.db.export_progress_checkpoint(ckpt_path)
+
                     if self.config.max_books_per_source > 0:
                         async with completed_lock:
                             saved_so_far = spider.epub_count + spider.pdf_count
@@ -122,8 +131,11 @@ class ParallelCrawlEngine:
             *(consumer() for _ in range(worker_count)),
         )
 
-        if not spider.status_message.startswith("Bị chặn") and not spider.status_message.startswith("Không thể"):
+        if not spider.status_message.startswith(("Bị chặn", "Không thể", "Đạt hạn mức")):
             spider.status_message = "Hoàn tất"
+            await self.db.update_source_checkpoint(
+                spider.name, status_note="Hoàn tất phiên (sẵn sàng chạy tiếp)"
+            )
 
     async def _upload_checkpoint_to_gdrive(self, ckpt_path: Path) -> None:
         if not (self.config.use_gdrive and self.gdrive.is_available and ckpt_path.exists()):
