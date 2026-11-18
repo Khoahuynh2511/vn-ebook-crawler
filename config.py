@@ -32,7 +32,6 @@ ALL_SOURCES: List[str] = list(SOURCE_MIRRORS.keys())
 ACTIVE_SOURCES: List[str] = [
     "sach_gallery",
     "metaisach",
-    "thuviensach",
     "sachhayonline",
 ]
 

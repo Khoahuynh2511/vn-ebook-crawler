@@ -13,13 +13,12 @@ pip install -r requirements.txt
 - Dùng `--no-katana` để chuyển về chế độ quét Python thuần, `--katana-depth N` để chỉnh độ sâu crawl, hoặc `--katana-headless` để bật chế độ headless (`-hl`) cho trang render bằng JS.
 
 ## Nguồn sách hỗ trợ
-Khi chạy `--sources all` (mặc định), crawler tập trung vào **4 nguồn tiếng Việt hiệu quả** (`ACTIVE_SOURCES`):
+Khi chạy `--sources all` (mặc định), crawler tập trung vào **3 nguồn tiếng Việt hiệu quả** (`ACTIVE_SOURCES`):
 - `sach_gallery` (`www.sach.gallery`) — Kho EPUB chọn lọc chất lượng cao, tải trực tiếp `/tai/<id>` (lưu ý giới hạn 20 lượt tải `/tai/` mỗi ngày/IP; tự lưu điểm dừng khi đạt hạn mức).
 - `metaisach` (`metaisach.com`) — Kho PDF/EPUB đồ sộ (hơn 8.200 đầu sách tải thẳng từ `media.metaisach.com`).
-- `thuviensach` (`thuviensach.vn`) — Thư viện ebook tổng hợp (ưu tiên các chuyên mục có link EPUB/PDF trực tiếp).
 - `sachhayonline` (`www.sachhayonline.com`) — Sách văn học, lịch sử, kỹ năng theo chương / PDF; tự động gom chương đóng gói thành file `.epub`.
 
-*(Các adapter cũ `isach`, `sachvui`, `nhasachmienphi`, `dtv_ebook` được giữ mã nguồn tham khảo nhưng mặc định bỏ qua).*
+*(Nguồn `thuviensach` đã tạm dừng khỏi `--sources all` sau khi thu thập xong 399 cuốn còn link tải; các adapter `isach`, `sachvui`, `nhasachmienphi`, `dtv_ebook`, `thuviensach` vẫn được giữ mã nguồn và có thể chạy riêng qua `--sources <tên>`).*
 
 ## Cách sử dụng
 
