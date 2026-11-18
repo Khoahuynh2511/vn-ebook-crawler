@@ -1,4 +1,3 @@
-from spiders.archive_org import ArchiveOrgEnglishSpider, ArchiveOrgSpider
 from spiders.base import BaseEbookSpider, BookData
 from spiders.chapter_sites import IsachSpider, SachHayOnlineSpider
 from spiders.dtv_ebook import DtvEbookSpider
@@ -16,8 +15,6 @@ SPIDER_REGISTRY = {
     "thuviensach": ThuVienSachSpider,
     "isach": IsachSpider,
     "sachhayonline": SachHayOnlineSpider,
-    "archive_org": ArchiveOrgSpider,
-    "archive_org_en": ArchiveOrgEnglishSpider,
 }
 
 __all__ = [
@@ -32,6 +29,4 @@ __all__ = [
     "ThuVienSachSpider",
     "IsachSpider",
     "SachHayOnlineSpider",
-    "ArchiveOrgSpider",
-    "ArchiveOrgEnglishSpider",
 ]

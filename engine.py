@@ -26,7 +26,9 @@ class ParallelCrawlEngine:
         self.db = CatalogDB(config.db_path)
         self.downloader = FileDownloader()
         self.gdrive = GDriveUploader(
-            self.db, root_folder_id=config.gdrive_root_id
+            self.db,
+            root_folder_id=config.gdrive_root_id,
+            upload_concurrency=max(4, min(8, config.download_concurrency // 2)),
         )
         self.download_sem = asyncio.Semaphore(config.download_concurrency)
         self._ckpt_lock = asyncio.Lock()
